@@ -1,0 +1,1 @@
+python scripts/gr00t_finetune.py --dataset-path ./demo_data/G1_pick_ball_1606 --data_config g1_vr_right_hand_only --no-tune_diffusion_model --num-gpus 1
