@@ -1,1 +1,1 @@
-python scripts/gr00t_finetune.py --dataset-path ./demo_data/G1_pick_ball_1606 --data_config g1_vr_left_hand_only --video-backend torchvision_av --no-tune_diffusion_model --num-gpus 1 --batch-size 4
+python scripts/gr00t_finetune.py --dataset-path ./demo_data/G1_pick_ball_1606 --data_config g1_vr_left_hand_only --video-backend torchvision_av --report-to tensorboard --no-tune-llm --no-tune-visual --no-tune-diffusion-model --tune-projector --lora-rank 8 --no-lora-full-model --num-gpus 1 --batch-size 4 --output_dir ./tmp/groot
