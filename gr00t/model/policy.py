@@ -176,11 +176,53 @@ class Gr00tPolicy(BasePolicy):
         if not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
         return unnormalized_action
+    
+    def get_realtime_action(self, observations: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Make a prediction with the model.
+        Args:
+            obs (Dict[str, Any]): The observation to make a prediction for.
+
+        e.g. obs = {
+            "video.<>": np.ndarray,  # (T, H, W, C)
+            "state.<>": np.ndarray, # (T, D)
+        }
+
+        or with batched input:
+        e.g. obs = {
+            "video.<>": np.ndarray,, # (B, T, H, W, C)
+            "state.<>": np.ndarray, # (B, T, D)
+        }
+
+        Returns:
+            Dict[str, Any]: The predicted action.
+        """
+        # let the get_action handles both batch and single input
+        is_batch = self._check_state_is_batched(observations)
+        if not is_batch:
+            observations = unsqueeze_dict_values(observations)
+        # Apply transforms
+        normalized_input = self.apply_transforms(observations)
+
+        normalized_action = self._get_realtime_action_from_normalized_input(normalized_input)
+        unnormalized_action = self._get_unnormalized_action(normalized_action)
+
+        if not is_batch:
+            unnormalized_action = squeeze_dict_values(unnormalized_action)
+        return unnormalized_action
 
     def _get_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
         # Set up autocast context if needed
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
             model_pred = self.model.get_action(normalized_input)
+
+        normalized_action = model_pred["action_pred"].float()
+        return normalized_action
+    
+    def _get_realtime_action_from_normalized_input(self, normalized_input: Dict[str, Any]) -> torch.Tensor:
+        # Set up autocast context if needed
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+            model_pred = self.model.get_realtime_action(normalized_input)
 
         normalized_action = model_pred["action_pred"].float()
         return normalized_action

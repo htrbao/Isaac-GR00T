@@ -30,6 +30,37 @@ from gr00t.model.action_head.action_encoder import (
 from .cross_attention_dit import DiT, SelfAttentionTransformer
 
 
+def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> torch.Tensor:
+    """
+    With start=2, end=6, total=10, the output will be:
+    1  1  4/5 3/5 2/5 1/5 0  0  0  0
+           ^              ^
+         start           end
+    `start` (inclusive) is where the chunk starts being allowed to change. `end` (exclusive) is where the chunk stops
+    paying attention to the prefix. if start == 0, then the entire chunk is allowed to change. if end == total, then the
+    entire prefix is attended to.
+
+    `end` takes precedence over `start` in the sense that, if `end < start`, then `start` is pushed down to `end`. Thus,
+    if `end` is 0, then the entire prefix will always be ignored.
+    """
+    assert schedule in ["ones", "zeros", "linear", "exp"], f"Invalid schedule: {schedule}"
+    start = min(start, end)
+    idx = torch.arange(total, dtype=torch.float32)
+    if schedule == "ones":
+        w = torch.ones(total, dtype=torch.float32)
+    elif schedule == "zeros":
+        w = (idx < start).float()
+    elif schedule == "linear" or schedule == "exp":
+        w = torch.clamp((start - 1 - idx) / (end - start + 1) + 1, min=0, max=1)
+        if schedule == "exp":
+            # torch.expm1(x) = exp(x) - 1, torch.e = math.e
+            w = w * torch.expm1(w) / (torch.tensor(torch.e) - 1)
+    else:
+        raise ValueError(f"Invalid schedule: {schedule}")
+    w = torch.where(idx >= end, torch.tensor(0.0, dtype=w.dtype), w)PrefixAttentionSchedule
+    return w
+
+
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
         super().__init__()
@@ -404,6 +435,70 @@ class FlowmatchingActionHead(nn.Module):
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity
         return BatchFeature(data={"action_pred": actions})
+    
+    @torch.no_grad()
+    def get_realtime_action(
+        self,
+        rng: torch.Generator,
+        backbone_output: torch.Tensor,
+        prev_action_chunk: torch.Tensor,  # [batch, horizon, action_dim]
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str,
+        max_guidance_weight: float,
+    ) -> torch.Tensor:
+        num_steps = self.num_inference_timesteps
+        dt = 1.0 / num_steps
+        batch_size, horizon, action_dim = backbone_output.shape[0], self.config.action_horizon, self.action_dim
+
+        backbone_output = self.process_backbone_output(backbone_output)
+
+        # Replace JAX random with torch random
+        noise = torch.randn((batch_size, horizon, action_dim), generator=rng, device=backbone_output.device)
+        x_t = noise
+        time = torch.tensor(0.0, device=backbone_output.device)
+
+        for _ in range(num_steps):
+            # weights: [horizon]
+            weights = get_prefix_weights(
+                inference_delay, prefix_attention_horizon, self.config.action_horizon, prefix_attention_schedule
+            )
+            weights = torch.tensor(weights, device=backbone_output.device, dtype=backbone_output.dtype)
+
+            # vmap over batch
+            v_t_list = []
+            for i in range(batch_size):
+                def denoiser(x_t_):
+                    v_t = self(backbone_output[i:i+1], x_t_.unsqueeze(0), time)[0]
+                    return x_t_ + v_t * (1 - time), v_t
+
+                x_1, v_t = denoiser(x_t[i])
+                # Compute VJP using torch autograd
+                x_t_i = x_t[i].detach().requires_grad_(True)
+                x_1_i, v_t_i = denoiser(x_t_i)
+                error = (prev_action_chunk[i] - x_1_i) * weights[:, None]
+                grad_outputs = error
+                pinv_correction, = torch.autograd.grad(
+                    outputs=x_1_i,
+                    inputs=x_t_i,
+                    grad_outputs=grad_outputs,
+                    retain_graph=True,
+                    allow_unused=True
+                )
+                if pinv_correction is None:
+                    pinv_correction = torch.zeros_like(x_t_i)
+                inv_r2 = (time**2 + (1 - time)**2) / ((1 - time)**2)
+                c = torch.nan_to_num((1 - time) / time, nan=0.0, posinf=max_guidance_weight)
+                guidance_weight = torch.minimum(c * inv_r2, torch.tensor(max_guidance_weight, device=backbone_output.device))
+                v_t_corr = v_t + guidance_weight * pinv_correction
+                v_t_list.append(v_t_corr)
+
+            v_t = torch.stack(v_t_list, dim=0)
+            x_t = x_t + dt * v_t
+            time = time + dt
+
+        assert x_t.shape == (batch_size, horizon, action_dim), x_t.shape
+        return BatchFeature(data={"action_pred": x_t})
 
     @property
     def device(self):

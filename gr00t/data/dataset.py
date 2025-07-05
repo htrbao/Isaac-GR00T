@@ -109,6 +109,7 @@ class LeRobotSingleDataset(Dataset):
         video_backend: str = "decord",
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
+        need_control_output: bool = False,
     ):
         """
         Initialize the dataset.
@@ -143,7 +144,10 @@ class LeRobotSingleDataset(Dataset):
         self._metadata = self._get_metadata(EmbodimentTag(self.tag))
         self._trajectory_ids, self._trajectory_lengths = self._get_trajectories()
         self._all_steps = self._get_all_steps()
+        self.need_control_output = need_control_output
         self._modality_keys = self._get_modality_keys()
+        if self.need_control_output:
+            self._modality_keys["past_action"] = self._modality_keys["action"]
         self._delta_indices = self._get_delta_indices()
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
@@ -525,12 +529,19 @@ class LeRobotSingleDataset(Dataset):
                     "action.eef_position": [B, T, action_dim],
                     "action.eef_rotation": [B, T, action_dim],
                 },
+                "past_action": {
+                    "action.eef_position": [B, -T, action_dim],
+                    "action.eef_rotation": [B, -T, action_dim],
+                },
             }
         """
         data = {}
         # Get the data for all modalities
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
         for modality in self.modality_keys:
+            if modality == "past_action":
+                
+                continue
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
